@@ -8,10 +8,21 @@ const { ensureDefaultAdmin, getDefaults } = require('./services/ensureDefaultAdm
 
 const app = express();
 
-const corsOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000,http://localhost:3001')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+/** Always allowed + anything in CORS_ORIGINS (Render env). Edit here when admin Netlify URL changes. */
+const DEFAULT_BROWSER_ORIGINS = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'https://clever-begonia-69b4a5.netlify.app'
+];
+const corsOrigins = [
+  ...new Set([
+    ...DEFAULT_BROWSER_ORIGINS,
+    ...(process.env.CORS_ORIGINS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  ])
+];
 
 app.use(cors({ origin: corsOrigins, credentials: true }));
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
