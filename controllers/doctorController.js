@@ -1,93 +1,194 @@
-const db = require('../config/db');
+const { User, DoctorProfile, DoctorAvailability, Review, nextId } = require('../models');
 
-// Get all doctors (with filters)
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 exports.getDoctors = async (req, res) => {
   try {
     const { specialization, city, search, page = 1, limit = 12 } = req.query;
-    let query = `
-      SELECT u.id, u.name, u.avatar, u.city, u.state,
-             dp.id as doctor_id, dp.specialization, dp.qualification, dp.experience_years,
-             dp.consultation_fee, dp.rating, dp.total_reviews, dp.available_online,
-             dp.available_offline, dp.hospital_name, dp.bio, dp.languages
-      FROM users u
-      JOIN doctor_profiles dp ON u.id = dp.user_id
-      WHERE u.role = 'doctor' AND u.is_active = TRUE AND dp.profile_approved = TRUE
-    `;
-    const params = [];
-    if (specialization) { query += ' AND dp.specialization = ?'; params.push(specialization); }
-    if (city) { query += ' AND u.city LIKE ?'; params.push(`%${city}%`); }
-    if (search) { query += ' AND (u.name LIKE ? OR dp.specialization LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
-    query += ' ORDER BY dp.rating DESC';
-    const offset = (page - 1) * limit;
-    query += ` LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`;
-    const [doctors] = await db.execute(query, params);
-    res.json({ success: true, doctors, page: parseInt(page), limit: parseInt(limit) });
+    const matchDp = { profile_approved: true };
+    if (specialization) matchDp.specialization = specialization;
+
+    const pipeline = [
+      { $match: matchDp },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'user_id',
+          foreignField: 'id',
+          as: 'u'
+        }
+      },
+      { $unwind: '$u' },
+      { $match: { 'u.role': 'doctor', 'u.is_active': true } }
+    ];
+
+    if (city) {
+      pipeline.push({ $match: { 'u.city': new RegExp(escapeRegex(city), 'i') } });
+    }
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), 'i');
+      pipeline.push({ $match: { $or: [{ 'u.name': rx }, { specialization: rx }] } });
+    }
+
+    pipeline.push(
+      {
+        $project: {
+          _id: 0,
+          id: '$u.id',
+          name: '$u.name',
+          avatar: '$u.avatar',
+          city: '$u.city',
+          state: '$u.state',
+          doctor_id: '$id',
+          specialization: 1,
+          qualification: 1,
+          experience_years: 1,
+          consultation_fee: 1,
+          rating: 1,
+          total_reviews: 1,
+          available_online: 1,
+          available_offline: 1,
+          hospital_name: 1,
+          bio: 1,
+          languages: 1
+        }
+      },
+      { $sort: { rating: -1 } },
+      { $skip: (parseInt(page, 10) - 1) * parseInt(limit, 10) },
+      { $limit: parseInt(limit, 10) }
+    );
+
+    const doctors = await DoctorProfile.aggregate(pipeline);
+    res.json({ success: true, doctors, page: parseInt(page, 10), limit: parseInt(limit, 10) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Get single doctor
 exports.getDoctorById = async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await db.execute(`
-      SELECT u.id, u.name, u.avatar, u.city, u.state, u.phone,
-             dp.*, dp.id as doctor_profile_id
-      FROM users u
-      JOIN doctor_profiles dp ON u.id = dp.user_id
-      WHERE u.id = ? AND u.is_active = TRUE
-    `, [id]);
-    if (rows.length === 0) return res.status(404).json({ success: false, message: 'Doctor not found.' });
-    const [slots] = await db.execute(
-      'SELECT * FROM doctor_availability WHERE doctor_id = ? AND is_active = TRUE',
-      [rows[0].doctor_profile_id]
-    );
-    const [reviews] = await db.execute(`
-      SELECT r.*, u.name as patient_name, u.avatar as patient_avatar
-      FROM reviews r JOIN users u ON r.patient_id = u.id
-      WHERE r.doctor_id = ? ORDER BY r.created_at DESC LIMIT 10
-    `, [rows[0].doctor_profile_id]);
-    res.json({ success: true, doctor: rows[0], slots, reviews });
+    const uid = parseInt(id, 10);
+    const u = await User.findOne({ id: uid, role: 'doctor', is_active: true }).lean();
+    if (!u) return res.status(404).json({ success: false, message: 'Doctor not found.' });
+    const dp = await DoctorProfile.findOne({ user_id: uid }).lean();
+    if (!dp) return res.status(404).json({ success: false, message: 'Doctor not found.' });
+    const { id: _dpid, user_id: _uid, _id: _dpm, __v: _dpv, ...dpRest } = dp;
+    const doctor = {
+      id: u.id,
+      name: u.name,
+      avatar: u.avatar,
+      city: u.city,
+      state: u.state,
+      phone: u.phone,
+      doctor_profile_id: dp.id,
+      ...dpRest
+    };
+    const slots = await DoctorAvailability.find({
+      doctor_id: doctor.doctor_profile_id,
+      is_active: true
+    }).lean();
+    const cleanSlots = slots.map(({ _id, __v, ...r }) => r);
+    const reviews = await Review.aggregate([
+      { $match: { doctor_id: doctor.doctor_profile_id } },
+      { $sort: { created_at: -1 } },
+      { $limit: 10 },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'patient_id',
+          foreignField: 'id',
+          as: 'u'
+        }
+      },
+      { $unwind: '$u' },
+      {
+        $project: {
+          _id: 0,
+          id: 1,
+          appointment_id: 1,
+          patient_id: 1,
+          doctor_id: 1,
+          rating: 1,
+          comment: 1,
+          created_at: 1,
+          patient_name: '$u.name',
+          patient_avatar: '$u.avatar'
+        }
+      }
+    ]);
+    res.json({ success: true, doctor, slots: cleanSlots, reviews });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Get specializations list
 exports.getSpecializations = async (req, res) => {
   try {
-    const [rows] = await db.execute(
-      'SELECT DISTINCT specialization, COUNT(*) as count FROM doctor_profiles WHERE profile_approved = TRUE GROUP BY specialization ORDER BY count DESC'
-    );
+    const rows = await DoctorProfile.aggregate([
+      { $match: { profile_approved: true } },
+      { $group: { _id: '$specialization', count: { $sum: 1 } } },
+      { $project: { specialization: '$_id', count: 1, _id: 0 } },
+      { $sort: { count: -1 } }
+    ]);
     res.json({ success: true, specializations: rows });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Create/Update doctor profile (by doctor)
 exports.updateDoctorProfile = async (req, res) => {
   try {
-    const { specialization, qualification, experience_years, bio, consultation_fee,
-            languages, available_online, available_offline, hospital_name, hospital_address } = req.body;
-    const [existing] = await db.execute('SELECT id FROM doctor_profiles WHERE user_id = ?', [req.user.id]);
-    if (existing.length > 0) {
-      await db.execute(`
-        UPDATE doctor_profiles SET specialization=?, qualification=?, experience_years=?, bio=?,
-        consultation_fee=?, languages=?, available_online=?, available_offline=?, hospital_name=?, hospital_address=?
-        WHERE user_id=?`,
-        [specialization, qualification, experience_years, bio, consultation_fee,
-         languages, available_online, available_offline, hospital_name, hospital_address, req.user.id]
+    const {
+      specialization,
+      qualification,
+      experience_years,
+      bio,
+      consultation_fee,
+      languages,
+      available_online,
+      available_offline,
+      hospital_name,
+      hospital_address
+    } = req.body;
+    const existing = await DoctorProfile.findOne({ user_id: req.user.id }).lean();
+    if (existing) {
+      await DoctorProfile.updateOne(
+        { user_id: req.user.id },
+        {
+          $set: {
+            specialization,
+            qualification,
+            experience_years,
+            bio,
+            consultation_fee,
+            languages,
+            available_online,
+            available_offline,
+            hospital_name,
+            hospital_address
+          }
+        }
       );
     } else {
-      await db.execute(`
-        INSERT INTO doctor_profiles (user_id, specialization, qualification, experience_years, bio, consultation_fee, languages, available_online, available_offline, hospital_name, hospital_address)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [req.user.id, specialization, qualification, experience_years, bio, consultation_fee,
-         languages, available_online, available_offline, hospital_name, hospital_address]
-      );
+      const newId = await nextId('doctor_profiles');
+      await DoctorProfile.create({
+        id: newId,
+        user_id: req.user.id,
+        specialization,
+        qualification,
+        experience_years,
+        bio,
+        consultation_fee,
+        languages,
+        available_online,
+        available_offline,
+        hospital_name,
+        hospital_address
+      });
     }
     res.json({ success: true, message: 'Doctor profile updated.' });
   } catch (err) {

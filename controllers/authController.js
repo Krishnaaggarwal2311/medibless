@@ -1,7 +1,6 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { v4: uuidv4 } = require('uuid');
-const db = require('../config/db');
+const { User, nextId } = require('../models');
 const { getJwtSecret } = require('../config/jwt');
 
 const generateToken = (user) => {
@@ -12,24 +11,29 @@ const generateToken = (user) => {
   );
 };
 
-// Register
 exports.register = async (req, res) => {
   try {
     const { name, email, phone, password, role = 'patient', date_of_birth, gender } = req.body;
     if (role === 'admin') {
       return res.status(403).json({ success: false, message: 'Invalid registration.' });
     }
-    const [existing] = await db.execute('SELECT id FROM users WHERE email = ?', [email]);
-    if (existing.length > 0) {
+    const existing = await User.findOne({ email }).lean();
+    if (existing) {
       return res.status(409).json({ success: false, message: 'Email already registered.' });
     }
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(password, salt);
-    const [result] = await db.execute(
-      'INSERT INTO users (name, email, phone, password_hash, role, date_of_birth, gender) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [name, email, phone, password_hash, role, date_of_birth || null, gender || null]
-    );
-    const userId = result.insertId;
+    const userId = await nextId('users');
+    await User.create({
+      id: userId,
+      name,
+      email,
+      phone: phone || '',
+      password_hash,
+      role,
+      date_of_birth: date_of_birth || null,
+      gender: gender || null
+    });
     const token = generateToken({ id: userId, email, role });
     res.status(201).json({
       success: true,
@@ -43,21 +47,19 @@ exports.register = async (req, res) => {
   }
 };
 
-// Login
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
-    const [rows] = await db.execute('SELECT * FROM users WHERE email = ? AND is_active = TRUE', [email]);
-    if (rows.length === 0) {
+    const user = await User.findOne({ email, is_active: true }).lean();
+    if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid email or password.' });
     }
-    const user = rows[0];
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
       return res.status(401).json({ success: false, message: 'Invalid email or password.' });
     }
     const token = generateToken(user);
-    const { password_hash, ...userSafe } = user;
+    const { password_hash: _ph, _id, __v, ...userSafe } = user;
     res.json({ success: true, message: 'Login successful!', token, user: userSafe });
   } catch (err) {
     console.error(err);
@@ -65,27 +67,24 @@ exports.login = async (req, res) => {
   }
 };
 
-// Get Profile
 exports.getProfile = async (req, res) => {
   try {
-    const [rows] = await db.execute(
-      'SELECT id, name, email, phone, role, avatar, date_of_birth, gender, address, city, state, pincode, created_at FROM users WHERE id = ?',
-      [req.user.id]
-    );
-    if (rows.length === 0) return res.status(404).json({ success: false, message: 'User not found.' });
-    res.json({ success: true, user: rows[0] });
+    const user = await User.findOne({ id: req.user.id })
+      .select('id name email phone role avatar date_of_birth gender address city state pincode created_at')
+      .lean();
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    res.json({ success: true, user });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Update Profile
 exports.updateProfile = async (req, res) => {
   try {
     const { name, phone, date_of_birth, gender, address, city, state, pincode } = req.body;
-    await db.execute(
-      'UPDATE users SET name=?, phone=?, date_of_birth=?, gender=?, address=?, city=?, state=?, pincode=? WHERE id=?',
-      [name, phone, date_of_birth, gender, address, city, state, pincode, req.user.id]
+    await User.updateOne(
+      { id: req.user.id },
+      { $set: { name, phone, date_of_birth, gender, address, city, state, pincode } }
     );
     res.json({ success: true, message: 'Profile updated successfully.' });
   } catch (err) {
@@ -93,7 +92,6 @@ exports.updateProfile = async (req, res) => {
   }
 };
 
-// Change Password
 exports.changePassword = async (req, res) => {
   try {
     const { current_password, new_password } = req.body;
@@ -103,13 +101,13 @@ exports.changePassword = async (req, res) => {
     if (String(new_password).length < 6) {
       return res.status(400).json({ success: false, message: 'New password must be at least 6 characters.' });
     }
-    const [rows] = await db.execute('SELECT password_hash FROM users WHERE id = ?', [req.user.id]);
-    const user = rows[0];
+    const user = await User.findOne({ id: req.user.id }).select('password_hash').lean();
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     const isMatch = await bcrypt.compare(current_password, user.password_hash);
     if (!isMatch) return res.status(400).json({ success: false, message: 'Current password is incorrect.' });
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(new_password, salt);
-    await db.execute('UPDATE users SET password_hash = ? WHERE id = ?', [password_hash, req.user.id]);
+    await User.updateOne({ id: req.user.id }, { $set: { password_hash } });
     res.json({ success: true, message: 'Password changed successfully.' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });

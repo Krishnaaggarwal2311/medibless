@@ -7,6 +7,6 @@ const { authMiddleware, roleMiddleware } = require('../middleware/auth');
 router.get('/', getDoctors);
 router.get('/specializations', getSpecializations);
 router.get('/:id', getDoctorById);
-router.put('/profile', authMiddleware, roleMiddleware('doctor', 'admin'), updateDoctorProfile);
+router.put('/profile', authMiddleware, roleMiddleware('doctor'), updateDoctorProfile);
 
 module.exports = router;

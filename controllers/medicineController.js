@@ -1,5 +1,14 @@
 const crypto = require('crypto');
-const db = require('../config/db');
+const mongoose = require('mongoose');
+const {
+  Cart,
+  Medicine,
+  MedicineCategory,
+  Order,
+  OrderItem,
+  Notification,
+  nextId
+} = require('../models');
 
 let razorpayClient = null;
 function getRazorpay() {
@@ -15,13 +24,33 @@ function getRazorpay() {
   return razorpayClient;
 }
 
-/** Cart rows for pricing / order (same as place order) */
 async function fetchCartItemsForOrder(userId) {
-  const [rows] = await db.execute(
-    `SELECT c.*, m.price, m.discount_percent, m.name, m.stock_quantity
-     FROM cart c JOIN medicines m ON c.medicine_id = m.id WHERE c.user_id = ?`,
-    [userId]
-  );
+  const rows = await Cart.aggregate([
+    { $match: { user_id: userId } },
+    {
+      $lookup: {
+        from: 'medicines',
+        localField: 'medicine_id',
+        foreignField: 'id',
+        as: 'm'
+      }
+    },
+    { $unwind: '$m' },
+    {
+      $project: {
+        _id: 0,
+        id: 1,
+        user_id: 1,
+        medicine_id: 1,
+        quantity: 1,
+        prescription_url: 1,
+        price: '$m.price',
+        discount_percent: '$m.discount_percent',
+        name: '$m.name',
+        stock_quantity: '$m.stock_quantity'
+      }
+    }
+  ]);
   return rows;
 }
 
@@ -52,114 +81,229 @@ async function commitOrderFromCart(
   m,
   { delivery_address, delivery_name, delivery_phone, payment_method, payment_status, notes = null }
 ) {
-  const order_number = `MB${Date.now()}`;
-  const estimated_delivery = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-  const [orderResult] = await db.execute(
-    `INSERT INTO orders (user_id, order_number, total_amount, discount_amount, delivery_charge, final_amount,
-        payment_method, payment_status, delivery_address, delivery_name, delivery_phone, estimated_delivery, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      userId,
-      order_number,
-      m.total,
-      m.discount,
-      m.delivery_charge,
-      m.final_amount,
-      payment_method,
-      payment_status,
-      delivery_address,
-      delivery_name,
-      delivery_phone,
-      estimated_delivery,
-      notes
-    ]
-  );
-  const orderId = orderResult.insertId;
-
-  for (const item of cartItems) {
-    const unit_price = (item.price - (item.price * item.discount_percent) / 100).toFixed(2);
-    const item_total = (parseFloat(unit_price) * item.quantity).toFixed(2);
-    await db.execute(
-      'INSERT INTO order_items (order_id, medicine_id, quantity, unit_price, total_price) VALUES (?, ?, ?, ?, ?)',
-      [orderId, item.medicine_id, item.quantity, unit_price, item_total]
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const order_number = `MB${Date.now()}`;
+    const estimated_delivery = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const orderId = await nextId('orders', session);
+    await Order.create(
+      [
+        {
+          id: orderId,
+          user_id: userId,
+          order_number,
+          total_amount: parseFloat(m.total),
+          discount_amount: parseFloat(m.discount),
+          delivery_charge: m.delivery_charge,
+          final_amount: parseFloat(m.final_amount),
+          payment_method,
+          payment_status,
+          delivery_address,
+          delivery_name,
+          delivery_phone,
+          estimated_delivery,
+          notes
+        }
+      ],
+      { session }
     );
-    await db.execute('UPDATE medicines SET stock_quantity = stock_quantity - ? WHERE id = ?', [item.quantity, item.medicine_id]);
-  }
 
-  await db.execute('DELETE FROM cart WHERE user_id = ?', [userId]);
-  await db.execute('INSERT INTO notifications (user_id, title, message, type) VALUES (?, ?, ?, ?)', [
-    userId,
-    'Order Placed!',
-    `Your order #${order_number} has been placed. Estimated delivery: ${estimated_delivery}.`,
-    'order'
-  ]);
-  return { order_id: orderId, order_number, final_amount: m.final_amount };
+    for (const item of cartItems) {
+      const unit_price = (item.price - (item.price * item.discount_percent) / 100).toFixed(2);
+      const item_total = (parseFloat(unit_price) * item.quantity).toFixed(2);
+      const oiId = await nextId('order_items', session);
+      await OrderItem.create(
+        [
+          {
+            id: oiId,
+            order_id: orderId,
+            medicine_id: item.medicine_id,
+            quantity: item.quantity,
+            unit_price: parseFloat(unit_price),
+            total_price: parseFloat(item_total)
+          }
+        ],
+        { session }
+      );
+      await Medicine.updateOne(
+        { id: item.medicine_id },
+        { $inc: { stock_quantity: -item.quantity } },
+        { session }
+      );
+    }
+
+    await Cart.deleteMany({ user_id: userId }, { session });
+    const nid = await nextId('notifications', session);
+    await Notification.create(
+      [
+        {
+          id: nid,
+          user_id: userId,
+          title: 'Order Placed!',
+          message: `Your order #${order_number} has been placed. Estimated delivery: ${estimated_delivery}.`,
+          type: 'order'
+        }
+      ],
+      { session }
+    );
+
+    await session.commitTransaction();
+    return { order_id: orderId, order_number, final_amount: m.final_amount };
+  } catch (e) {
+    await session.abortTransaction();
+    throw e;
+  } finally {
+    session.endSession();
+  }
 }
 
-// Get medicines
 exports.getMedicines = async (req, res) => {
   try {
     const { category_id, search, requires_prescription, page = 1, limit = 16, sort = 'name' } = req.query;
-    let query = `
-      SELECT m.*, mc.name as category_name,
-             ROUND(m.price - (m.price * m.discount_percent / 100), 2) as discounted_price
-      FROM medicines m LEFT JOIN medicine_categories mc ON m.category_id = mc.id
-      WHERE m.is_active = TRUE
-    `;
-    const params = [];
-    if (category_id) { query += ' AND m.category_id = ?'; params.push(category_id); }
-    if (search) { query += ' AND (m.name LIKE ? OR m.brand LIKE ? OR m.composition LIKE ?)'; params.push(`%${search}%`, `%${search}%`, `%${search}%`); }
-    if (requires_prescription !== undefined) { query += ' AND m.requires_prescription = ?'; params.push(requires_prescription === 'true' ? 1 : 0); }
+    const match = { is_active: true };
+    if (category_id) match.category_id = parseInt(category_id, 10);
+    if (requires_prescription !== undefined) {
+      match.requires_prescription = requires_prescription === 'true';
+    }
+    if (search) {
+      const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      match.$or = [{ name: rx }, { brand: rx }, { composition: rx }];
+    }
 
-    const sortMap = { name: 'm.name ASC', price_low: 'discounted_price ASC', price_high: 'discounted_price DESC', discount: 'm.discount_percent DESC' };
-    query += ` ORDER BY ${sortMap[sort] || 'm.name ASC'}`;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    query += ` LIMIT ${parseInt(limit)} OFFSET ${offset}`;
-    const [medicines] = await db.execute(query, params);
+    const pipeline = [
+      { $match: match },
+      {
+        $addFields: {
+          discounted_price: {
+            $round: [{ $subtract: ['$price', { $multiply: ['$price', { $divide: ['$discount_percent', 100] }] }] }, 2]
+          }
+        }
+      },
+      {
+        $lookup: {
+          from: 'medicine_categories',
+          localField: 'category_id',
+          foreignField: 'id',
+          as: 'mc'
+        }
+      },
+      {
+        $addFields: {
+          category_name: { $ifNull: [{ $arrayElemAt: ['$mc.name', 0] }, ''] }
+        }
+      },
+      { $project: { mc: 0 } }
+    ];
+
+    const sortMap = {
+      name: { name: 1 },
+      price_low: { discounted_price: 1 },
+      price_high: { discounted_price: -1 },
+      discount: { discount_percent: -1 }
+    };
+    pipeline.push({ $sort: sortMap[sort] || { name: 1 } });
+    pipeline.push({ $skip: (parseInt(page, 10) - 1) * parseInt(limit, 10) });
+    pipeline.push({ $limit: parseInt(limit, 10) });
+
+    const raw = await Medicine.aggregate(pipeline);
+    const medicines = raw.map(({ _id, __v, ...rest }) => rest);
     res.json({ success: true, medicines });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Get medicine by id
 exports.getMedicineById = async (req, res) => {
   try {
-    const [rows] = await db.execute(`
-      SELECT m.*, mc.name as category_name,
-             ROUND(m.price - (m.price * m.discount_percent / 100), 2) as discounted_price
-      FROM medicines m LEFT JOIN medicine_categories mc ON m.category_id = mc.id
-      WHERE m.id = ? AND m.is_active = TRUE`, [req.params.id]
-    );
+    const rows = await Medicine.aggregate([
+      { $match: { id: parseInt(req.params.id, 10), is_active: true } },
+      {
+        $addFields: {
+          discounted_price: {
+            $round: [{ $subtract: ['$price', { $multiply: ['$price', { $divide: ['$discount_percent', 100] }] }] }, 2]
+          }
+        }
+      },
+      {
+        $lookup: {
+          from: 'medicine_categories',
+          localField: 'category_id',
+          foreignField: 'id',
+          as: 'mc'
+        }
+      },
+      { $addFields: { category_name: { $ifNull: [{ $arrayElemAt: ['$mc.name', 0] }, ''] } } },
+      { $project: { mc: 0 } }
+    ]);
     if (rows.length === 0) return res.status(404).json({ success: false, message: 'Medicine not found.' });
-    res.json({ success: true, medicine: rows[0] });
+    const { _id, __v, ...med } = rows[0];
+    res.json({ success: true, medicine: med });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Get categories
 exports.getCategories = async (req, res) => {
   try {
-    const [rows] = await db.execute('SELECT * FROM medicine_categories WHERE is_active = TRUE');
-    res.json({ success: true, categories: rows });
+    const rows = await MedicineCategory.find({ is_active: true }).lean();
+    const categories = rows.map(({ _id, __v, ...r }) => r);
+    res.json({ success: true, categories });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Cart operations
 exports.getCart = async (req, res) => {
   try {
-    const [items] = await db.execute(`
-      SELECT c.id, c.quantity, c.prescription_url,
-             m.id as medicine_id, m.name, m.brand, m.image_url, m.unit,
-             m.requires_prescription,
-             ROUND(m.price - (m.price * m.discount_percent / 100), 2) as unit_price,
-             ROUND((m.price - (m.price * m.discount_percent / 100)) * c.quantity, 2) as total_price
-      FROM cart c JOIN medicines m ON c.medicine_id = m.id
-      WHERE c.user_id = ?`, [req.user.id]
-    );
+    const items = await Cart.aggregate([
+      { $match: { user_id: req.user.id } },
+      {
+        $lookup: {
+          from: 'medicines',
+          localField: 'medicine_id',
+          foreignField: 'id',
+          as: 'm'
+        }
+      },
+      { $unwind: '$m' },
+      {
+        $project: {
+          _id: 0,
+          id: 1,
+          quantity: 1,
+          prescription_url: 1,
+          medicine_id: '$m.id',
+          name: '$m.name',
+          brand: '$m.brand',
+          image_url: '$m.image_url',
+          unit: '$m.unit',
+          requires_prescription: '$m.requires_prescription',
+          unit_price: {
+            $round: [
+              { $subtract: ['$m.price', { $multiply: ['$m.price', { $divide: ['$m.discount_percent', 100] }] }] },
+              2
+            ]
+          },
+          total_price: {
+            $round: [
+              {
+                $multiply: [
+                  {
+                    $subtract: [
+                      '$m.price',
+                      { $multiply: ['$m.price', { $divide: ['$m.discount_percent', 100] }] }
+                    ]
+                  },
+                  '$quantity'
+                ]
+              },
+              2
+            ]
+          }
+        }
+      }
+    ]);
     const total = items.reduce((sum, i) => sum + parseFloat(i.total_price), 0);
     res.json({ success: true, items, total: total.toFixed(2) });
   } catch (err) {
@@ -170,11 +314,18 @@ exports.getCart = async (req, res) => {
 exports.addToCart = async (req, res) => {
   try {
     const { medicine_id, quantity = 1 } = req.body;
-    const [existing] = await db.execute('SELECT id, quantity FROM cart WHERE user_id=? AND medicine_id=?', [req.user.id, medicine_id]);
-    if (existing.length > 0) {
-      await db.execute('UPDATE cart SET quantity = quantity + ? WHERE id = ?', [quantity, existing[0].id]);
+    const mid = parseInt(medicine_id, 10);
+    const existing = await Cart.findOne({ user_id: req.user.id, medicine_id: mid }).lean();
+    if (existing) {
+      await Cart.updateOne({ id: existing.id }, { $inc: { quantity: parseInt(quantity, 10) || 1 } });
     } else {
-      await db.execute('INSERT INTO cart (user_id, medicine_id, quantity) VALUES (?, ?, ?)', [req.user.id, medicine_id, quantity]);
+      const cid = await nextId('cart');
+      await Cart.create({
+        id: cid,
+        user_id: req.user.id,
+        medicine_id: mid,
+        quantity: parseInt(quantity, 10) || 1
+      });
     }
     res.json({ success: true, message: 'Added to cart.' });
   } catch (err) {
@@ -186,10 +337,11 @@ exports.updateCartItem = async (req, res) => {
   try {
     const { id } = req.params;
     const { quantity } = req.body;
-    if (quantity <= 0) {
-      await db.execute('DELETE FROM cart WHERE id = ? AND user_id = ?', [id, req.user.id]);
+    const q = parseInt(quantity, 10);
+    if (q <= 0) {
+      await Cart.deleteOne({ id: parseInt(id, 10), user_id: req.user.id });
     } else {
-      await db.execute('UPDATE cart SET quantity = ? WHERE id = ? AND user_id = ?', [quantity, id, req.user.id]);
+      await Cart.updateOne({ id: parseInt(id, 10), user_id: req.user.id }, { $set: { quantity: q } });
     }
     res.json({ success: true, message: 'Cart updated.' });
   } catch (err) {
@@ -199,14 +351,13 @@ exports.updateCartItem = async (req, res) => {
 
 exports.removeFromCart = async (req, res) => {
   try {
-    await db.execute('DELETE FROM cart WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
+    await Cart.deleteOne({ id: parseInt(req.params.id, 10), user_id: req.user.id });
     res.json({ success: true, message: 'Item removed from cart.' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Place order (COD / wallet only — online uses Razorpay create + verify)
 exports.placeOrder = async (req, res) => {
   try {
     const { delivery_address, delivery_name, delivery_phone, payment_method = 'cod' } = req.body;
@@ -252,7 +403,6 @@ exports.placeOrder = async (req, res) => {
   }
 };
 
-// Create Razorpay order (server amount from cart)
 exports.createRazorpayOrder = async (req, res) => {
   try {
     const rzp = getRazorpay();
@@ -295,7 +445,6 @@ exports.createRazorpayOrder = async (req, res) => {
   }
 };
 
-// Verify signature and create paid order
 exports.verifyRazorpayPayment = async (req, res) => {
   try {
     const rzp = getRazorpay();
@@ -372,20 +521,43 @@ exports.verifyRazorpayPayment = async (req, res) => {
   }
 };
 
-// Get orders
 exports.getMyOrders = async (req, res) => {
   try {
-    const [orders] = await db.execute(
-      'SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC', [req.user.id]
-    );
+    const orders = await Order.find({ user_id: req.user.id }).sort({ created_at: -1 }).lean();
+    const out = [];
     for (const order of orders) {
-      const [items] = await db.execute(`
-        SELECT oi.*, m.name, m.brand, m.image_url, m.unit
-        FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.order_id = ?`, [order.id]
-      );
-      order.items = items;
+      const { _id, __v, ...o } = order;
+      const items = await OrderItem.aggregate([
+        { $match: { order_id: order.id } },
+        {
+          $lookup: {
+            from: 'medicines',
+            localField: 'medicine_id',
+            foreignField: 'id',
+            as: 'm'
+          }
+        },
+        { $unwind: '$m' },
+        {
+          $project: {
+            _id: 0,
+            id: 1,
+            order_id: 1,
+            medicine_id: 1,
+            quantity: 1,
+            unit_price: 1,
+            total_price: 1,
+            name: '$m.name',
+            brand: '$m.brand',
+            image_url: '$m.image_url',
+            unit: '$m.unit'
+          }
+        }
+      ]);
+      o.items = items;
+      out.push(o);
     }
-    res.json({ success: true, orders });
+    res.json({ success: true, orders: out });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }

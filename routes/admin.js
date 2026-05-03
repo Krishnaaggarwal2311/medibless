@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { authMiddleware, roleMiddleware } = require('../middleware/auth');
+const { adminAuthMiddleware } = require('../middleware/adminAuth');
 const {
   getDashboard,
   getUsers,
@@ -17,8 +17,9 @@ const {
   getAppSettings,
   updateAppSettings
 } = require('../controllers/adminController');
+const { updateAppointmentStatus } = require('../controllers/appointmentController');
 
-router.use(authMiddleware, roleMiddleware('admin'));
+router.use(adminAuthMiddleware);
 
 router.get('/dashboard', getDashboard);
 router.get('/users', getUsers);
@@ -26,6 +27,7 @@ router.patch('/users/:id/active', setUserActive);
 router.delete('/users/:id', deleteUser);
 
 router.get('/appointments', getAppointments);
+router.put('/appointments/:id/status', updateAppointmentStatus);
 router.put('/appointments/:id/cancel', adminCancelAppointment);
 
 router.get('/doctors/pending', getPendingDoctors);

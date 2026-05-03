@@ -1,35 +1,61 @@
-const db = require('../config/db');
+const {
+  User,
+  Appointment,
+  DoctorProfile,
+  Order,
+  Review,
+  Medicine,
+  Cart,
+  Notification,
+  DoctorAvailability,
+  OrderItem,
+  AppSettings
+} = require('../models');
 
-// Dashboard summary
+function localYMD() {
+  const n = new Date();
+  return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
+}
+
+function escapeRx(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 exports.getDashboard = async (req, res) => {
   try {
-    const [roleCounts] = await db.execute(
-      "SELECT role, COUNT(*) as count FROM users GROUP BY role"
-    );
-    const [todayAppts] = await db.execute(
-      "SELECT COUNT(*) as c FROM appointments WHERE appointment_date = CURDATE()"
-    );
-    const [pendingDoctors] = await db.execute(
-      'SELECT COUNT(*) as c FROM doctor_profiles WHERE profile_approved = FALSE'
-    );
-    const [orderStats] = await db.execute(
-      `SELECT
-        COUNT(*) as total_orders,
-        SUM(CASE WHEN status IN ('placed','confirmed','processing') THEN 1 ELSE 0 END) as active_orders
-       FROM orders`
-    );
-    const [revenue] = await db.execute(
-      'SELECT COALESCE(SUM(final_amount), 0) as total_revenue FROM orders'
-    );
+    const usersByRole = await User.aggregate([
+      { $match: { role: { $in: ['patient', 'doctor'] } } },
+      { $group: { _id: '$role', count: { $sum: 1 } } },
+      { $project: { _id: 0, role: '$_id', count: 1 } }
+    ]);
+    const today = localYMD();
+    const appointmentsToday = await Appointment.countDocuments({ appointment_date: today });
+    const pendingDoctorApprovals = await DoctorProfile.countDocuments({ profile_approved: false });
+    const [orderAgg] = await Order.aggregate([
+      {
+        $group: {
+          _id: null,
+          total_orders: { $sum: 1 },
+          active_orders: {
+            $sum: {
+              $cond: [{ $in: ['$status', ['placed', 'confirmed', 'processing']] }, 1, 0]
+            }
+          }
+        }
+      }
+    ]);
+    const [revAgg] = await Order.aggregate([
+      { $group: { _id: null, total_revenue: { $sum: '$final_amount' } } }
+    ]);
     res.json({
       success: true,
       dashboard: {
-        usersByRole: roleCounts,
-        appointmentsToday: todayAppts[0]?.c || 0,
-        pendingDoctorApprovals: pendingDoctors[0]?.c || 0,
-        totalOrders: orderStats[0]?.total_orders || 0,
-        activeOrders: orderStats[0]?.active_orders || 0,
-        totalRevenue: parseFloat(revenue[0]?.total_revenue || 0)
+        usersByRole,
+        appointmentsToday,
+        pendingDoctorApprovals,
+        totalOrders: orderAgg?.total_orders || 0,
+        activeOrders: orderAgg?.active_orders || 0,
+        totalRevenue: parseFloat(revAgg?.total_revenue || 0)
       }
     });
   } catch (err) {
@@ -38,65 +64,43 @@ exports.getDashboard = async (req, res) => {
   }
 };
 
-// List users
 exports.getUsers = async (req, res) => {
   try {
     const { role, search, page = 1, limit = 20, status } = req.query;
-    let q = `SELECT id, name, email, phone, role, is_active, is_verified, created_at
-             FROM users WHERE 1=1`;
-    const params = [];
-    if (status === 'active') {
-      q += ' AND is_active = TRUE';
-    } else if (status === 'blocked' || status === 'inactive') {
-      q += ' AND is_active = FALSE';
-    }
-    if (role) {
-      q += ' AND role = ?';
-      params.push(role);
-    }
+    const filter = {};
+    if (status === 'active') filter.is_active = true;
+    else if (status === 'blocked' || status === 'inactive') filter.is_active = false;
+    if (role) filter.role = role;
     if (search) {
-      q += ' AND (name LIKE ? OR email LIKE ? OR phone LIKE ?)';
-      const s = `%${search}%`;
-      params.push(s, s, s);
+      const rx = new RegExp(escapeRx(search), 'i');
+      filter.$or = [{ name: rx }, { email: rx }, { phone: rx }];
     }
-    q += ' ORDER BY created_at DESC';
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    q += ` LIMIT ${parseInt(limit)} OFFSET ${offset}`;
-    const [rows] = await db.execute(q, params);
-    let countQ = 'SELECT COUNT(*) as total FROM users WHERE 1=1';
-    const cParams = [];
-    if (status === 'active') {
-      countQ += ' AND is_active = TRUE';
-    } else if (status === 'blocked' || status === 'inactive') {
-      countQ += ' AND is_active = FALSE';
-    }
-    if (role) {
-      countQ += ' AND role = ?';
-      cParams.push(role);
-    }
-    if (search) {
-      countQ += ' AND (name LIKE ? OR email LIKE ? OR phone LIKE ?)';
-      const s = `%${search}%`;
-      cParams.push(s, s, s);
-    }
-    const [countRows] = await db.execute(countQ, cParams);
-    let statSql = `SELECT
-        COUNT(*) AS total,
-        SUM(CASE WHEN is_active = TRUE OR is_active = 1 THEN 1 ELSE 0 END) AS active,
-        SUM(CASE WHEN is_active = FALSE OR is_active = 0 THEN 1 ELSE 0 END) AS blocked
-      FROM users WHERE 1=1`;
-    const statParams = [];
-    if (role) {
-      statSql += ' AND role = ?';
-      statParams.push(role);
-    }
-    const [[statRow]] = await db.execute(statSql, statParams);
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+    const users = await User.find(filter)
+      .select('id name email phone role is_active is_verified created_at')
+      .sort({ created_at: -1 })
+      .skip(skip)
+      .limit(parseInt(limit, 10))
+      .lean();
+    const total = await User.countDocuments(filter);
+    const statMatch = { ...filter };
+    const [statRow] = await User.aggregate([
+      { $match: statMatch },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          active: { $sum: { $cond: ['$is_active', 1, 0] } },
+          blocked: { $sum: { $cond: ['$is_active', 0, 1] } }
+        }
+      }
+    ]);
     res.json({
       success: true,
-      users: rows,
-      total: countRows[0]?.total || 0,
-      page: parseInt(page),
-      limit: parseInt(limit),
+      users,
+      total,
+      page: parseInt(page, 10),
+      limit: parseInt(limit, 10),
       stats: {
         total: Number(statRow?.total) || 0,
         active: Number(statRow?.active) || 0,
@@ -109,111 +113,139 @@ exports.getUsers = async (req, res) => {
   }
 };
 
-// Remove user (only if no blocking references)
 exports.deleteUser = async (req, res) => {
   try {
     const { id } = req.params;
     const uid = parseInt(id, 10);
-    if (uid === req.user.id) {
-      return res.status(400).json({ success: false, message: 'You cannot delete your own account.' });
-    }
-    const [uRows] = await db.execute('SELECT id, role FROM users WHERE id = ?', [uid]);
-    if (uRows.length === 0) {
+    const u = await User.findOne({ id: uid }).lean();
+    if (!u) {
       return res.status(404).json({ success: false, message: 'User not found.' });
     }
-    const [[apRows], [ordRows], [revRows]] = await Promise.all([
-      db.execute('SELECT COUNT(*) as c FROM appointments WHERE patient_id = ?', [uid]),
-      db.execute('SELECT COUNT(*) as c FROM orders WHERE user_id = ?', [uid]),
-      db.execute('SELECT COUNT(*) as c FROM reviews WHERE patient_id = ?', [uid])
+    if (u.email && req.admin.email && u.email.toLowerCase() === req.admin.email.toLowerCase()) {
+      return res.status(400).json({ success: false, message: 'You cannot delete the user linked to this admin email.' });
+    }
+    const [apC, ordC, revC] = await Promise.all([
+      Appointment.countDocuments({ patient_id: uid }),
+      Order.countDocuments({ user_id: uid }),
+      Review.countDocuments({ patient_id: uid })
     ]);
-    const apC = apRows[0]?.c || 0;
-    const ordC = ordRows[0]?.c || 0;
-    const revC = revRows[0]?.c || 0;
     if (apC > 0 || ordC > 0 || revC > 0) {
       return res.status(409).json({
         success: false,
         message: 'This user has appointments, orders, or reviews. Block the account instead of deleting.'
       });
     }
-    const [dProf] = await db.execute('SELECT id FROM doctor_profiles WHERE user_id = ?', [uid]);
-    if (dProf.length > 0) {
-      const docId = dProf[0].id;
-      const [aDoc] = await db.execute('SELECT COUNT(*) as c FROM appointments WHERE doctor_id = ?', [docId]);
-      if ((aDoc[0]?.c || 0) > 0) {
+    const dProf = await DoctorProfile.findOne({ user_id: uid }).lean();
+    if (dProf) {
+      const aDoc = await Appointment.countDocuments({ doctor_id: dProf.id });
+      if (aDoc > 0) {
         return res.status(409).json({
           success: false,
           message: 'This doctor has appointments. Block the account or remove linked data first.'
         });
       }
+      await DoctorAvailability.deleteMany({ doctor_id: dProf.id });
+      await DoctorProfile.deleteMany({ user_id: uid });
     }
-    await db.execute('DELETE FROM users WHERE id = ?', [uid]);
+    await Cart.deleteMany({ user_id: uid });
+    await Notification.deleteMany({ user_id: uid });
+    await User.deleteOne({ id: uid });
     res.json({ success: true, message: 'User removed.' });
   } catch (err) {
-    if (err.code === 'ER_ROW_IS_REFERENCED' || err.code === 'ER_ROW_IS_REFERENCED_2' || err.errno === 1451) {
-      return res.status(409).json({
-        success: false,
-        message: 'Cannot remove this user: related records still exist. Block the account instead.'
-      });
-    }
     console.error(err);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Toggle user active
 exports.setUserActive = async (req, res) => {
   try {
     const { id } = req.params;
     const { is_active } = req.body;
-    if (parseInt(id) === req.user.id) {
-      return res.status(400).json({ success: false, message: 'You cannot disable your own account.' });
+    const target = await User.findOne({ id: parseInt(id, 10) }).select('email').lean();
+    if (target?.email && req.admin.email && target.email.toLowerCase() === req.admin.email.toLowerCase()) {
+      return res.status(400).json({ success: false, message: 'You cannot disable the user linked to this admin email.' });
     }
-    await db.execute('UPDATE users SET is_active = ? WHERE id = ?', [is_active ? 1 : 0, id]);
+    await User.updateOne({ id: parseInt(id, 10) }, { $set: { is_active: !!is_active } });
     res.json({ success: true, message: 'User updated.' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// All appointments
 exports.getAppointments = async (req, res) => {
   try {
     const { status, page = 1, limit = 20 } = req.query;
-    let q = `
-      SELECT a.*,
-        pu.name as patient_name, pu.email as patient_email, pu.phone as patient_phone,
-        du.name as doctor_name, du.email as doctor_email,
-        dp.specialization, dp.hospital_name, dp.id as doctor_profile_id
-      FROM appointments a
-      JOIN users pu ON a.patient_id = pu.id
-      JOIN doctor_profiles dp ON a.doctor_id = dp.id
-      JOIN users du ON dp.user_id = du.id
-      WHERE 1=1
-    `;
-    const params = [];
-    if (status) {
-      q += ' AND a.status = ?';
-      params.push(status);
-    }
-    q += ' ORDER BY a.appointment_date DESC, a.appointment_time DESC';
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    q += ` LIMIT ${parseInt(limit)} OFFSET ${offset}`;
-    const [rows] = await db.execute(q, params);
-    let cq = `
-      SELECT COUNT(*) as total FROM appointments a WHERE 1=1
-    `;
-    const cp = [];
-    if (status) {
-      cq += ' AND a.status = ?';
-      cp.push(status);
-    }
-    const [crows] = await db.execute(cq, cp);
+    const match = {};
+    if (status) match.status = status;
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+    const rows = await Appointment.aggregate([
+      { $match: match },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'patient_id',
+          foreignField: 'id',
+          as: 'pu'
+        }
+      },
+      { $unwind: '$pu' },
+      {
+        $lookup: {
+          from: 'doctor_profiles',
+          localField: 'doctor_id',
+          foreignField: 'id',
+          as: 'dp'
+        }
+      },
+      { $unwind: '$dp' },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'dp.user_id',
+          foreignField: 'id',
+          as: 'du'
+        }
+      },
+      { $unwind: '$du' },
+      {
+        $project: {
+          _id: 0,
+          id: 1,
+          patient_id: 1,
+          doctor_id: 1,
+          appointment_date: 1,
+          appointment_time: 1,
+          type: 1,
+          status: 1,
+          symptoms: 1,
+          notes: 1,
+          prescription_url: 1,
+          consultation_fee: 1,
+          payment_status: 1,
+          meeting_link: 1,
+          created_at: 1,
+          updated_at: 1,
+          patient_name: '$pu.name',
+          patient_email: '$pu.email',
+          patient_phone: '$pu.phone',
+          doctor_name: '$du.name',
+          doctor_email: '$du.email',
+          specialization: '$dp.specialization',
+          hospital_name: '$dp.hospital_name',
+          doctor_profile_id: '$dp.id'
+        }
+      },
+      { $sort: { appointment_date: -1, appointment_time: -1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit, 10) }
+    ]);
+    const total = await Appointment.countDocuments(match);
     res.json({
       success: true,
       appointments: rows,
-      total: crows[0]?.total || 0,
-      page: parseInt(page),
-      limit: parseInt(limit)
+      total,
+      page: parseInt(page, 10),
+      limit: parseInt(limit, 10)
     });
   } catch (err) {
     console.error(err);
@@ -221,13 +253,12 @@ exports.getAppointments = async (req, res) => {
   }
 };
 
-// Admin cancel appointment
 exports.adminCancelAppointment = async (req, res) => {
   try {
     const { id } = req.params;
-    await db.execute(
-      'UPDATE appointments SET status = "cancelled" WHERE id = ? AND status IN ("pending","confirmed")',
-      [id]
+    await Appointment.updateOne(
+      { id: parseInt(id, 10), status: { $in: ['pending', 'confirmed'] } },
+      { $set: { status: 'cancelled' } }
     );
     res.json({ success: true, message: 'Appointment cancelled.' });
   } catch (err) {
@@ -235,18 +266,40 @@ exports.adminCancelAppointment = async (req, res) => {
   }
 };
 
-// Pending doctor profiles
 exports.getPendingDoctors = async (req, res) => {
   try {
-    const [rows] = await db.execute(`
-      SELECT dp.id, dp.user_id, dp.specialization, dp.qualification, dp.experience_years,
-        dp.registration_number, dp.hospital_name, dp.bio, dp.profile_approved,
-        u.name, u.email, u.phone, u.city, u.created_at
-      FROM doctor_profiles dp
-      JOIN users u ON dp.user_id = u.id
-      WHERE dp.profile_approved = FALSE
-      ORDER BY u.created_at ASC
-    `);
+    const rows = await DoctorProfile.aggregate([
+      { $match: { profile_approved: false } },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'user_id',
+          foreignField: 'id',
+          as: 'u'
+        }
+      },
+      { $unwind: '$u' },
+      {
+        $project: {
+          _id: 0,
+          id: 1,
+          user_id: 1,
+          specialization: 1,
+          qualification: 1,
+          experience_years: 1,
+          registration_number: 1,
+          hospital_name: 1,
+          bio: 1,
+          profile_approved: 1,
+          name: '$u.name',
+          email: '$u.email',
+          phone: '$u.phone',
+          city: '$u.city',
+          created_at: '$u.created_at'
+        }
+      },
+      { $sort: { created_at: 1 } }
+    ]);
     res.json({ success: true, doctors: rows });
   } catch (err) {
     console.error(err);
@@ -254,57 +307,102 @@ exports.getPendingDoctors = async (req, res) => {
   }
 };
 
-// Approve doctor
 exports.approveDoctor = async (req, res) => {
   try {
     const { id } = req.params;
-    await db.execute('UPDATE doctor_profiles SET profile_approved = TRUE WHERE id = ?', [id]);
+    await DoctorProfile.updateOne({ id: parseInt(id, 10) }, { $set: { profile_approved: true } });
     res.json({ success: true, message: 'Doctor profile approved.' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// All orders
 exports.getOrders = async (req, res) => {
   try {
     const { status, page = 1, limit = 20 } = req.query;
-    let q = `
-      SELECT o.*, u.name as user_name, u.email as user_email, u.phone as user_phone
-      FROM orders o
-      JOIN users u ON o.user_id = u.id
-      WHERE 1=1
-    `;
-    const params = [];
-    if (status) {
-      q += ' AND o.status = ?';
-      params.push(status);
-    }
-    q += ' ORDER BY o.created_at DESC';
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    q += ` LIMIT ${parseInt(limit)} OFFSET ${offset}`;
-    const [orders] = await db.execute(q, params);
+    const match = {};
+    if (status) match.status = status;
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+    const orders = await Order.aggregate([
+      { $match: match },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'user_id',
+          foreignField: 'id',
+          as: 'u'
+        }
+      },
+      { $unwind: '$u' },
+      {
+        $project: {
+          _id: 0,
+          id: 1,
+          user_id: 1,
+          order_number: 1,
+          total_amount: 1,
+          discount_amount: 1,
+          delivery_charge: 1,
+          final_amount: 1,
+          status: 1,
+          payment_method: 1,
+          payment_status: 1,
+          delivery_address: 1,
+          delivery_name: 1,
+          delivery_phone: 1,
+          prescription_url: 1,
+          tracking_number: 1,
+          estimated_delivery: 1,
+          delivered_at: 1,
+          notes: 1,
+          created_at: 1,
+          updated_at: 1,
+          user_name: '$u.name',
+          user_email: '$u.email',
+          user_phone: '$u.phone'
+        }
+      },
+      { $sort: { created_at: -1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit, 10) }
+    ]);
     for (const order of orders) {
-      const [items] = await db.execute(
-        `SELECT oi.*, m.name, m.brand, m.image_url, m.unit
-         FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.order_id = ?`,
-        [order.id]
-      );
+      const items = await OrderItem.aggregate([
+        { $match: { order_id: order.id } },
+        {
+          $lookup: {
+            from: 'medicines',
+            localField: 'medicine_id',
+            foreignField: 'id',
+            as: 'm'
+          }
+        },
+        { $unwind: '$m' },
+        {
+          $project: {
+            _id: 0,
+            id: 1,
+            order_id: 1,
+            medicine_id: 1,
+            quantity: 1,
+            unit_price: 1,
+            total_price: 1,
+            name: '$m.name',
+            brand: '$m.brand',
+            image_url: '$m.image_url',
+            unit: '$m.unit'
+          }
+        }
+      ]);
       order.items = items;
     }
-    let cq = 'SELECT COUNT(*) as total FROM orders o WHERE 1=1';
-    const cp = [];
-    if (status) {
-      cq += ' AND o.status = ?';
-      cp.push(status);
-    }
-    const [crows] = await db.execute(cq, cp);
+    const total = await Order.countDocuments(match);
     res.json({
       success: true,
       orders,
-      total: crows[0]?.total || 0,
-      page: parseInt(page),
-      limit: parseInt(limit)
+      total,
+      page: parseInt(page, 10),
+      limit: parseInt(limit, 10)
     });
   } catch (err) {
     console.error(err);
@@ -312,37 +410,20 @@ exports.getOrders = async (req, res) => {
   }
 };
 
-// Update order status
 exports.updateOrderStatus = async (req, res) => {
   try {
     const { id } = req.params;
     const { status, payment_status, tracking_number, notes } = req.body;
-    const fields = [];
-    const values = [];
-    if (status !== undefined) {
-      fields.push('status = ?');
-      values.push(status);
-    }
-    if (payment_status !== undefined) {
-      fields.push('payment_status = ?');
-      values.push(payment_status);
-    }
-    if (tracking_number !== undefined) {
-      fields.push('tracking_number = ?');
-      values.push(tracking_number);
-    }
-    if (notes !== undefined) {
-      fields.push('notes = ?');
-      values.push(notes);
-    }
-    if (fields.length === 0) {
+    const $set = {};
+    if (status !== undefined) $set.status = status;
+    if (payment_status !== undefined) $set.payment_status = payment_status;
+    if (tracking_number !== undefined) $set.tracking_number = tracking_number;
+    if (notes !== undefined) $set.notes = notes;
+    if (status === 'delivered') $set.delivered_at = new Date();
+    if (Object.keys($set).length === 0) {
       return res.status(400).json({ success: false, message: 'No fields to update.' });
     }
-    values.push(id);
-    await db.execute(`UPDATE orders SET ${fields.join(', ')} WHERE id = ?`, values);
-    if (status === 'delivered') {
-      await db.execute('UPDATE orders SET delivered_at = NOW() WHERE id = ?', [id]);
-    }
+    await Order.updateOne({ id: parseInt(id, 10) }, { $set });
     res.json({ success: true, message: 'Order updated.' });
   } catch (err) {
     console.error(err);
@@ -350,61 +431,58 @@ exports.updateOrderStatus = async (req, res) => {
   }
 };
 
-// List medicines (including inactive) for admin
 exports.getMedicines = async (req, res) => {
   try {
     const { search, page = 1, limit = 24 } = req.query;
-    let q = `
-      SELECT m.*, mc.name as category_name,
-        ROUND(m.price - (m.price * m.discount_percent / 100), 2) as discounted_price
-      FROM medicines m
-      LEFT JOIN medicine_categories mc ON m.category_id = mc.id
-      WHERE 1=1
-    `;
-    const params = [];
+    const match = {};
     if (search) {
-      q += ' AND (m.name LIKE ? OR m.brand LIKE ?)';
-      const s = `%${search}%`;
-      params.push(s, s);
+      const rx = new RegExp(escapeRx(search), 'i');
+      match.$or = [{ name: rx }, { brand: rx }];
     }
-    q += ' ORDER BY m.name ASC';
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    q += ` LIMIT ${parseInt(limit)} OFFSET ${offset}`;
-    const [rows] = await db.execute(q, params);
-    res.json({ success: true, medicines: rows, page: parseInt(page), limit: parseInt(limit) });
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+    const rows = await Medicine.aggregate([
+      { $match: match },
+      {
+        $addFields: {
+          discounted_price: {
+            $round: [{ $subtract: ['$price', { $multiply: ['$price', { $divide: ['$discount_percent', 100] }] }] }, 2]
+          }
+        }
+      },
+      {
+        $lookup: {
+          from: 'medicine_categories',
+          localField: 'category_id',
+          foreignField: 'id',
+          as: 'mc'
+        }
+      },
+      { $addFields: { category_name: { $ifNull: [{ $arrayElemAt: ['$mc.name', 0] }, ''] } } },
+      { $project: { mc: 0 } },
+      { $sort: { name: 1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit, 10) }
+    ]);
+    const medicines = rows.map(({ _id, __v, ...r }) => r);
+    res.json({ success: true, medicines, page: parseInt(page, 10), limit: parseInt(limit, 10) });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// Patch medicine (stock, active)
 exports.updateMedicine = async (req, res) => {
   try {
     const { id } = req.params;
     const { stock_quantity, is_active, price, discount_percent } = req.body;
-    const parts = [];
-    const vals = [];
-    if (stock_quantity !== undefined) {
-      parts.push('stock_quantity = ?');
-      vals.push(stock_quantity);
-    }
-    if (is_active !== undefined) {
-      parts.push('is_active = ?');
-      vals.push(is_active ? 1 : 0);
-    }
-    if (price !== undefined) {
-      parts.push('price = ?');
-      vals.push(price);
-    }
-    if (discount_percent !== undefined) {
-      parts.push('discount_percent = ?');
-      vals.push(discount_percent);
-    }
-    if (parts.length === 0) {
+    const $set = {};
+    if (stock_quantity !== undefined) $set.stock_quantity = stock_quantity;
+    if (is_active !== undefined) $set.is_active = !!is_active;
+    if (price !== undefined) $set.price = price;
+    if (discount_percent !== undefined) $set.discount_percent = discount_percent;
+    if (Object.keys($set).length === 0) {
       return res.status(400).json({ success: false, message: 'No fields to update.' });
     }
-    vals.push(id);
-    await db.execute(`UPDATE medicines SET ${parts.join(', ')} WHERE id = ?`, vals);
+    await Medicine.updateOne({ id: parseInt(id, 10) }, { $set });
     res.json({ success: true, message: 'Medicine updated.' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -425,17 +503,13 @@ const DEFAULT_APP_SETTINGS = {
 
 exports.getAppSettings = async (req, res) => {
   try {
-    const [rows] = await db.execute(
-      'SELECT id, app_name, support_email, support_phone, website_url, about_text, terms_text, privacy_text, updated_at FROM app_settings WHERE id = 1'
-    );
-    if (rows.length === 0) {
+    const row = await AppSettings.findOne({ id: 1 }).lean();
+    if (!row) {
       return res.json({ success: true, settings: { ...DEFAULT_APP_SETTINGS } });
     }
-    return res.json({ success: true, settings: rows[0] });
+    const { _id, __v, ...settings } = row;
+    return res.json({ success: true, settings });
   } catch (err) {
-    if (err.code === 'ER_NO_SUCH_TABLE') {
-      return res.json({ success: true, settings: { ...DEFAULT_APP_SETTINGS } });
-    }
     console.error(err);
     return res.status(500).json({ success: false, message: 'Server error.' });
   }
@@ -452,35 +526,12 @@ exports.updateAppSettings = async (req, res) => {
       website_url: t(website_url).trim().slice(0, 500),
       about_text: t(about_text),
       terms_text: t(terms_text),
-      privacy_text: t(privacy_text)
+      privacy_text: t(privacy_text),
+      updated_at: new Date()
     };
-    const vals = [
-      payload.app_name,
-      payload.support_email,
-      payload.support_phone,
-      payload.website_url,
-      payload.about_text,
-      payload.terms_text,
-      payload.privacy_text
-    ];
-    const [u] = await db.execute(
-      'UPDATE app_settings SET app_name=?, support_email=?, support_phone=?, website_url=?, about_text=?, terms_text=?, privacy_text=? WHERE id=1',
-      vals
-    );
-    if (u.affectedRows === 0) {
-      await db.execute(
-        'INSERT INTO app_settings (id, app_name, support_email, support_phone, website_url, about_text, terms_text, privacy_text) VALUES (1,?,?,?,?,?,?,?)',
-        vals
-      );
-    }
+    await AppSettings.updateOne({ id: 1 }, { $set: { ...payload, id: 1 } }, { upsert: true });
     return res.json({ success: true, message: 'App settings saved.', settings: { id: 1, ...payload } });
   } catch (err) {
-    if (err.code === 'ER_NO_SUCH_TABLE') {
-      return res.status(503).json({
-        success: false,
-        message: 'Database table app_settings is missing. Run the latest schema (app_settings in medbless/database/schema.sql) and import again.'
-      });
-    }
     console.error(err);
     return res.status(500).json({ success: false, message: 'Server error.' });
   }

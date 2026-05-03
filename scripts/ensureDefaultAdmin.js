@@ -1,36 +1,26 @@
 /**
- * Idempotent: ensures default admin exists with known credentials.
- * Run: node scripts/ensureDefaultAdmin.js   (from backend folder)
+ * Idempotent: default admin in `admins` collection.
+ * Run: npm run admin:ensure   (from backend folder)
+ *
+ * This script **resets password** for the default admin email to match .env (recovery).
+ * Server boot only **creates** if missing — see services/ensureDefaultAdmin.js
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
-const bcrypt = require('bcryptjs');
-const db = require('../config/db');
-
-const EMAIL = 'admin@medbless.local';
-const PASSWORD = 'Admin@123';
-const NAME = 'MedBless Admin';
-const PHONE = '0000000000';
+const { connectDb } = require('../config/db');
+const { ensureDefaultAdmin, getDefaults } = require('../services/ensureDefaultAdmin');
 
 async function main() {
-  const salt = await bcrypt.genSalt(10);
-  const password_hash = await bcrypt.hash(PASSWORD, salt);
+  await connectDb();
+  const { email, password } = getDefaults();
+  await ensureDefaultAdmin({ forceReset: true });
 
-  await db.execute(
-    `INSERT INTO users (name, email, phone, password_hash, role, is_verified, is_active)
-     VALUES (?, ?, ?, ?, 'admin', TRUE, TRUE)
-     ON DUPLICATE KEY UPDATE
-       password_hash = VALUES(password_hash),
-       role = 'admin',
-       is_active = TRUE,
-       is_verified = TRUE,
-       name = VALUES(name)`,
-    [NAME, EMAIL, PHONE, password_hash]
-  );
-
-  console.log('Default admin is ready:');
-  console.log('  Email:   ', EMAIL);
-  console.log('  Password:', PASSWORD);
+  console.log('Default admin (admins collection) is ready:');
+  console.log('  Email:   ', email);
+  console.log('  Password:', password);
   console.log('  (Change password after login.)');
+
+  const mongoose = require('mongoose');
+  await mongoose.disconnect();
   process.exit(0);
 }
 

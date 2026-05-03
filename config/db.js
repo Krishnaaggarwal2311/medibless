@@ -1,30 +1,26 @@
 const path = require('path');
-const mysql = require('mysql2/promise');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+const mongoose = require('mongoose');
 
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  port: process.env.DB_PORT || 3306,
-  database: process.env.DB_NAME || 'medbless',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  timezone: '+05:30',
-});
+// Load all models (registers schemas)
+require('../models');
 
-const testConnection = async () => {
-  try {
-    const conn = await pool.getConnection();
-    console.log('✅ MySQL connected successfully');
-    conn.release();
-  } catch (err) {
-    console.error('❌ MySQL connection failed:', err.code || err.errno, err.message || err);
-    process.exit(1);
-  }
-};
+const uri = process.env.MONGODB_URI;
+if (!uri || String(uri).trim() === '') {
+  console.error('❌ MONGODB_URI is not set in .env');
+  process.exit(1);
+}
 
-testConnection();
+async function connectDb() {
+  mongoose.set('strictQuery', true);
+  mongoose.set('bufferTimeoutMS', 30_000);
+  const u = String(uri).trim();
+  await mongoose.connect(u, {
+    serverSelectionTimeoutMS: 20_000,
+    connectTimeoutMS: 20_000
+  });
+  await mongoose.connection.db.admin().command({ ping: 1 });
+  console.log('✅ MongoDB connected');
+}
 
-module.exports = pool;
+module.exports = { connectDb, mongoose };
