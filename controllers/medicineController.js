@@ -9,6 +9,7 @@ const {
   Notification,
   nextId
 } = require('../models');
+const { discountedPriceExpr, discountedUnitExpr } = require('../utils/aggregation');
 
 let razorpayClient = null;
 function getRazorpay() {
@@ -205,6 +206,7 @@ exports.getMedicines = async (req, res) => {
     pipeline.push({ $sort: sortMap[sort] || { name: 1 } });
     pipeline.push({ $skip: (parseInt(page, 10) - 1) * parseInt(limit, 10) });
     pipeline.push({ $limit: parseInt(limit, 10) });
+    pipeline.push({ $project: { _discSort: 0 } });
 
     const raw = await Medicine.aggregate(pipeline);
     const medicines = raw.map(({ _id, __v, ...rest }) => rest);
@@ -220,9 +222,7 @@ exports.getMedicineById = async (req, res) => {
       { $match: { id: parseInt(req.params.id, 10), is_active: true } },
       {
         $addFields: {
-          discounted_price: {
-            $round: [{ $subtract: ['$price', { $multiply: ['$price', { $divide: ['$discount_percent', 100] }] }] }, 2]
-          }
+          discounted_price: discountedPriceExpr('$price', '$discount_percent')
         }
       },
       {
@@ -279,23 +279,13 @@ exports.getCart = async (req, res) => {
           image_url: '$m.image_url',
           unit: '$m.unit',
           requires_prescription: '$m.requires_prescription',
-          unit_price: {
-            $round: [
-              { $subtract: ['$m.price', { $multiply: ['$m.price', { $divide: ['$m.discount_percent', 100] }] }] },
-              2
-            ]
-          },
+          unit_price: discountedPriceExpr('$m.price', '$m.discount_percent'),
           total_price: {
             $round: [
               {
                 $multiply: [
-                  {
-                    $subtract: [
-                      '$m.price',
-                      { $multiply: ['$m.price', { $divide: ['$m.discount_percent', 100] }] }
-                    ]
-                  },
-                  '$quantity'
+                  discountedUnitExpr('$m.price', '$m.discount_percent'),
+                  { $toDouble: { $ifNull: ['$quantity', 0] } }
                 ]
               },
               2

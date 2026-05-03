@@ -11,6 +11,7 @@ const {
   OrderItem,
   AppSettings
 } = require('../models');
+const { discountedPriceExpr } = require('../utils/aggregation');
 
 function localYMD() {
   const n = new Date();
@@ -444,9 +445,7 @@ exports.getMedicines = async (req, res) => {
       { $match: match },
       {
         $addFields: {
-          discounted_price: {
-            $round: [{ $subtract: ['$price', { $multiply: ['$price', { $divide: ['$discount_percent', 100] }] }] }, 2]
-          }
+          discounted_price: discountedPriceExpr('$price', '$discount_percent')
         }
       },
       {
@@ -466,6 +465,7 @@ exports.getMedicines = async (req, res) => {
     const medicines = rows.map(({ _id, __v, ...r }) => r);
     res.json({ success: true, medicines, page: parseInt(page, 10), limit: parseInt(limit, 10) });
   } catch (err) {
+    console.error('admin.getMedicines', err);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
