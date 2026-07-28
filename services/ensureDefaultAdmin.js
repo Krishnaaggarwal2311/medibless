@@ -47,4 +47,43 @@ async function ensureDefaultAdmin(opts = {}) {
   return { email, created: true, reset: false };
 }
 
-module.exports = { ensureDefaultAdmin, getDefaults };
+async function ensureDefaultPatient(opts = {}) {
+  const { forceReset = false } = opts;
+  const email = (
+    process.env.PATIENT_EMAIL ||
+    process.env.ADMIN_EMAIL ||
+    'krishnaaggarwal2311@gmail.com'
+  )
+    .trim()
+    .toLowerCase();
+  const password = process.env.PATIENT_PASSWORD || process.env.ADMIN_PASSWORD || 'Admin@1234';
+  const name = process.env.PATIENT_NAME || process.env.ADMIN_NAME || 'Krishna Aggarwal';
+
+  const existing = await User.findOne({ email }).lean();
+  const salt = await bcrypt.genSalt(10);
+  const password_hash = await bcrypt.hash(password, salt);
+
+  if (existing) {
+    if (forceReset) {
+      await User.updateOne(
+        { email },
+        { $set: { password_hash, name, is_active: true, role: 'patient' } }
+      );
+    }
+    return { email, created: false, reset: forceReset };
+  }
+
+  const id = await nextId('users');
+  await User.create({
+    id,
+    name,
+    email,
+    phone: '',
+    password_hash,
+    role: 'patient',
+    is_active: true
+  });
+  return { email, created: true, reset: false };
+}
+
+module.exports = { ensureDefaultAdmin, ensureDefaultPatient, getDefaults };

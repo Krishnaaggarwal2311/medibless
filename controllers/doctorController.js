@@ -6,9 +6,11 @@ function escapeRegex(s) {
 
 exports.getDoctors = async (req, res) => {
   try {
-    const { specialization, city, search, page = 1, limit = 12 } = req.query;
+    const { specialization, city, search, page = 1, limit = 12, consult_type, sort } = req.query;
     const matchDp = { profile_approved: true };
     if (specialization) matchDp.specialization = specialization;
+    if (consult_type === 'online') matchDp.available_online = true;
+    if (consult_type === 'offline') matchDp.available_offline = true;
 
     const pipeline = [
       { $match: matchDp },
@@ -31,6 +33,14 @@ exports.getDoctors = async (req, res) => {
       const rx = new RegExp(escapeRegex(search), 'i');
       pipeline.push({ $match: { $or: [{ 'u.name': rx }, { specialization: rx }] } });
     }
+
+    const sortKey = sort === 'fee_low' ? 'fee_low' : sort === 'experience' ? 'experience' : 'rating';
+    const sortStage =
+      sortKey === 'fee_low'
+        ? { consultation_fee: 1 }
+        : sortKey === 'experience'
+          ? { experience_years: -1 }
+          : { rating: -1 };
 
     pipeline.push(
       {
@@ -55,7 +65,7 @@ exports.getDoctors = async (req, res) => {
           languages: 1
         }
       },
-      { $sort: { rating: -1 } },
+      { $sort: sortStage },
       { $skip: (parseInt(page, 10) - 1) * parseInt(limit, 10) },
       { $limit: parseInt(limit, 10) }
     );

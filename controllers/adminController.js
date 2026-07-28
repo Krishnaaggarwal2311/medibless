@@ -5,11 +5,13 @@ const {
   Order,
   Review,
   Medicine,
+  MedicineCategory,
   Cart,
   Notification,
   DoctorAvailability,
   OrderItem,
-  AppSettings
+  AppSettings,
+  nextId
 } = require('../models');
 const { discountedPriceExpr } = require('../utils/aggregation');
 
@@ -466,6 +468,123 @@ exports.getMedicines = async (req, res) => {
     res.json({ success: true, medicines, page: parseInt(page, 10), limit: parseInt(limit, 10) });
   } catch (err) {
     console.error('admin.getMedicines', err);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+exports.getMedicineCategories = async (req, res) => {
+  try {
+    const rows = await MedicineCategory.find({}).sort({ name: 1 }).lean();
+    const categories = rows.map(({ _id, __v, ...c }) => c);
+    res.json({ success: true, categories });
+  } catch (err) {
+    console.error('admin.getMedicineCategories', err);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+exports.createMedicine = async (req, res) => {
+  try {
+    const {
+      name,
+      brand,
+      category_id,
+      description,
+      price,
+      discount_percent,
+      stock_quantity,
+      unit,
+      requires_prescription,
+      is_active
+    } = req.body;
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ success: false, message: 'Medicine name is required.' });
+    }
+    const priceNum = parseFloat(price);
+    if (Number.isNaN(priceNum) || priceNum < 0) {
+      return res.status(400).json({ success: false, message: 'Valid price is required.' });
+    }
+    const cid =
+      category_id != null && category_id !== '' ? parseInt(category_id, 10) : null;
+    if (cid) {
+      const cat = await MedicineCategory.findOne({ id: cid }).lean();
+      if (!cat) return res.status(400).json({ success: false, message: 'Invalid category.' });
+    }
+    const id = await nextId('medicines');
+    const medicine = {
+      id,
+      name: String(name).trim(),
+      brand: String(brand || '').trim(),
+      category_id: cid,
+      description: String(description || '').trim(),
+      price: priceNum,
+      mrp: priceNum,
+      discount_percent: parseFloat(discount_percent) || 0,
+      stock_quantity: parseInt(stock_quantity, 10) || 0,
+      unit: String(unit || 'strip').trim(),
+      requires_prescription: !!requires_prescription,
+      is_active: is_active !== false
+    };
+    await Medicine.create(medicine);
+    res.status(201).json({ success: true, message: 'Medicine added.', medicine });
+  } catch (err) {
+    console.error('admin.createMedicine', err);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+exports.getMedicineById = async (req, res) => {
+  try {
+    const mid = parseInt(req.params.id, 10);
+    const rows = await Medicine.aggregate([
+      { $match: { id: mid } },
+      {
+        $addFields: {
+          discounted_price: discountedPriceExpr('$price', '$discount_percent')
+        }
+      },
+      {
+        $lookup: {
+          from: 'medicine_categories',
+          localField: 'category_id',
+          foreignField: 'id',
+          as: 'mc'
+        }
+      },
+      { $addFields: { category_name: { $ifNull: [{ $arrayElemAt: ['$mc.name', 0] }, ''] } } },
+      { $project: { mc: 0 } },
+      { $limit: 1 }
+    ]);
+    if (!rows.length) {
+      return res.status(404).json({ success: false, message: 'Medicine not found.' });
+    }
+    const { _id, __v, ...medicine } = rows[0];
+    res.json({ success: true, medicine });
+  } catch (err) {
+    console.error('admin.getMedicineById', err);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+exports.deleteMedicine = async (req, res) => {
+  try {
+    const mid = parseInt(req.params.id, 10);
+    const med = await Medicine.findOne({ id: mid }).lean();
+    if (!med) {
+      return res.status(404).json({ success: false, message: 'Medicine not found.' });
+    }
+    const orderCount = await OrderItem.countDocuments({ medicine_id: mid });
+    if (orderCount > 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'This medicine is linked to orders. Mark it inactive instead of deleting.'
+      });
+    }
+    await Cart.deleteMany({ medicine_id: mid });
+    await Medicine.deleteOne({ id: mid });
+    res.json({ success: true, message: 'Medicine removed.' });
+  } catch (err) {
+    console.error('admin.deleteMedicine', err);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };

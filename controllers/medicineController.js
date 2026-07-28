@@ -11,6 +11,10 @@ const {
 } = require('../models');
 const { discountedPriceExpr, discountedUnitExpr } = require('../utils/aggregation');
 
+function userId(req) {
+  return parseInt(req.user.id, 10);
+}
+
 let razorpayClient = null;
 function getRazorpay() {
   const keyId = process.env.RAZORPAY_KEY_ID;
@@ -257,7 +261,7 @@ exports.getCategories = async (req, res) => {
 exports.getCart = async (req, res) => {
   try {
     const items = await Cart.aggregate([
-      { $match: { user_id: req.user.id } },
+      { $match: { user_id: userId(req) } },
       {
         $lookup: {
           from: 'medicines',
@@ -305,14 +309,15 @@ exports.addToCart = async (req, res) => {
   try {
     const { medicine_id, quantity = 1 } = req.body;
     const mid = parseInt(medicine_id, 10);
-    const existing = await Cart.findOne({ user_id: req.user.id, medicine_id: mid }).lean();
+    const uid = userId(req);
+    const existing = await Cart.findOne({ user_id: uid, medicine_id: mid }).lean();
     if (existing) {
       await Cart.updateOne({ id: existing.id }, { $inc: { quantity: parseInt(quantity, 10) || 1 } });
     } else {
       const cid = await nextId('cart');
       await Cart.create({
         id: cid,
-        user_id: req.user.id,
+        user_id: uid,
         medicine_id: mid,
         quantity: parseInt(quantity, 10) || 1
       });
@@ -328,10 +333,12 @@ exports.updateCartItem = async (req, res) => {
     const { id } = req.params;
     const { quantity } = req.body;
     const q = parseInt(quantity, 10);
+    const uid = userId(req);
+    const cartId = parseInt(id, 10);
     if (q <= 0) {
-      await Cart.deleteOne({ id: parseInt(id, 10), user_id: req.user.id });
+      await Cart.deleteOne({ id: cartId, user_id: uid });
     } else {
-      await Cart.updateOne({ id: parseInt(id, 10), user_id: req.user.id }, { $set: { quantity: q } });
+      await Cart.updateOne({ id: cartId, user_id: uid }, { $set: { quantity: q } });
     }
     res.json({ success: true, message: 'Cart updated.' });
   } catch (err) {
@@ -341,7 +348,7 @@ exports.updateCartItem = async (req, res) => {
 
 exports.removeFromCart = async (req, res) => {
   try {
-    await Cart.deleteOne({ id: parseInt(req.params.id, 10), user_id: req.user.id });
+    await Cart.deleteOne({ id: parseInt(req.params.id, 10), user_id: userId(req) });
     res.json({ success: true, message: 'Item removed from cart.' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -364,7 +371,7 @@ exports.placeOrder = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Delivery details are required.' });
     }
 
-    const cartItems = await fetchCartItemsForOrder(req.user.id);
+    const cartItems = await fetchCartItemsForOrder(userId(req));
     if (cartItems.length === 0) return res.status(400).json({ success: false, message: 'Cart is empty.' });
     for (const item of cartItems) {
       if (item.quantity > item.stock_quantity) {
@@ -372,7 +379,7 @@ exports.placeOrder = async (req, res) => {
       }
     }
     const m = computeOrderAmounts(cartItems);
-    const out = await commitOrderFromCart(req.user.id, cartItems, m, {
+    const out = await commitOrderFromCart(userId(req), cartItems, m, {
       delivery_address: String(delivery_address).trim(),
       delivery_name: String(delivery_name).trim(),
       delivery_phone: String(delivery_phone).trim(),
@@ -402,8 +409,8 @@ exports.createRazorpayOrder = async (req, res) => {
         message: 'Razorpay is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET on the server.'
       });
     }
-    const userId = req.user.id;
-    const cartItems = await fetchCartItemsForOrder(userId);
+    const uid = userId(req);
+    const cartItems = await fetchCartItemsForOrder(uid);
     if (cartItems.length === 0) return res.status(400).json({ success: false, message: 'Cart is empty.' });
     for (const item of cartItems) {
       if (item.quantity > item.stock_quantity) {
@@ -414,12 +421,12 @@ exports.createRazorpayOrder = async (req, res) => {
     if (m.amountPaise < 100) {
       return res.status(400).json({ success: false, message: 'Order total must be at least ₹1.00' });
     }
-    const receipt = `mbu${userId}t${Date.now()}`.replace(/\s/g, '').slice(0, 40);
+    const receipt = `mbu${uid}t${Date.now()}`.replace(/\s/g, '').slice(0, 40);
     const order = await rzp.orders.create({
       amount: m.amountPaise,
       currency: 'INR',
       receipt,
-      notes: { user_id: String(userId) }
+      notes: { user_id: String(uid) }
     });
     res.json({
       success: true,
@@ -468,8 +475,8 @@ exports.verifyRazorpayPayment = async (req, res) => {
     if (payment.status !== 'captured' && payment.status !== 'authorized') {
       return res.status(400).json({ success: false, message: 'Payment was not successful.' });
     }
-    const userId = req.user.id;
-    const cartItems = await fetchCartItemsForOrder(userId);
+    const uid = userId(req);
+    const cartItems = await fetchCartItemsForOrder(uid);
     if (cartItems.length === 0) {
       return res.status(400).json({
         success: false,
@@ -490,7 +497,7 @@ exports.verifyRazorpayPayment = async (req, res) => {
       razorpay_payment_id,
       provider: 'razorpay'
     });
-    const out = await commitOrderFromCart(userId, cartItems, m, {
+    const out = await commitOrderFromCart(uid, cartItems, m, {
       delivery_address: String(delivery_address).trim(),
       delivery_name: String(delivery_name).trim(),
       delivery_phone: String(delivery_phone).trim(),

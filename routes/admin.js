@@ -13,7 +13,11 @@ const {
   getOrders,
   updateOrderStatus,
   getMedicines,
+  getMedicineById,
+  getMedicineCategories,
+  createMedicine,
   updateMedicine,
+  deleteMedicine,
   getAppSettings,
   updateAppSettings
 } = require('../controllers/adminController');
@@ -36,8 +40,12 @@ router.post('/doctors/:id/approve', approveDoctor);
 router.get('/orders', getOrders);
 router.patch('/orders/:id', updateOrderStatus);
 
+router.get('/medicine-categories', getMedicineCategories);
 router.get('/medicines', getMedicines);
+router.get('/medicines/:id', getMedicineById);
+router.post('/medicines', createMedicine);
 router.patch('/medicines/:id', updateMedicine);
+router.delete('/medicines/:id', deleteMedicine);
 
 router.get('/app-settings', getAppSettings);
 router.put('/app-settings', updateAppSettings);

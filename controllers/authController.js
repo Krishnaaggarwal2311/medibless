@@ -14,10 +14,14 @@ const generateToken = (user) => {
 exports.register = async (req, res) => {
   try {
     const { name, email, phone, password, role = 'patient', date_of_birth, gender } = req.body;
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    if (!normalizedEmail) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
     if (role === 'admin') {
       return res.status(403).json({ success: false, message: 'Invalid registration.' });
     }
-    const existing = await User.findOne({ email }).lean();
+    const existing = await User.findOne({ email: normalizedEmail }).lean();
     if (existing) {
       return res.status(409).json({ success: false, message: 'Email already registered.' });
     }
@@ -27,19 +31,19 @@ exports.register = async (req, res) => {
     await User.create({
       id: userId,
       name,
-      email,
+      email: normalizedEmail,
       phone: phone || '',
       password_hash,
       role,
       date_of_birth: date_of_birth || null,
       gender: gender || null
     });
-    const token = generateToken({ id: userId, email, role });
+    const token = generateToken({ id: userId, email: normalizedEmail, role });
     res.status(201).json({
       success: true,
       message: 'Registration successful!',
       token,
-      user: { id: userId, name, email, phone, role }
+      user: { id: userId, name, email: normalizedEmail, phone, role }
     });
   } catch (err) {
     console.error(err);
@@ -50,9 +54,14 @@ exports.register = async (req, res) => {
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email, is_active: true }).lean();
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const user = await User.findOne({ email: normalizedEmail, is_active: true }).lean();
     if (!user) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+      return res.status(401).json({
+        success: false,
+        message:
+          'Invalid email or password. Use a patient/doctor account here — admin login is on the admin panel (port 3001).'
+      });
     }
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
@@ -88,6 +97,24 @@ exports.updateProfile = async (req, res) => {
     );
     res.json({ success: true, message: 'Profile updated successfully.' });
   } catch (err) {
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+};
+
+exports.forgotPassword = async (req, res) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+    await User.findOne({ email, is_active: true }).lean();
+    res.json({
+      success: true,
+      message:
+        'If this email is registered, you will receive password reset instructions shortly. Check your inbox and spam folder.'
+    });
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };

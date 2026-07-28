@@ -4,7 +4,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { connectDb } = require('./config/db');
-const { ensureDefaultAdmin, getDefaults } = require('./services/ensureDefaultAdmin');
+const { ensureDefaultAdmin, ensureDefaultPatient, getDefaults } = require('./services/ensureDefaultAdmin');
 
 const app = express();
 
@@ -53,10 +53,14 @@ const PORT = process.env.PORT || 5000;
 
 connectDb()
   .then(() => ensureDefaultAdmin({ forceReset: false }))
-  .then((info) => {
-    if (info.created) {
+  .then((adminInfo) => ensureDefaultPatient({ forceReset: false }).then((patientInfo) => ({ adminInfo, patientInfo })))
+  .then(({ adminInfo, patientInfo }) => {
+    if (adminInfo.created) {
       const d = getDefaults();
       console.log(`✅ Default admin created: ${d.email} (set ADMIN_PASSWORD in .env to change default)`);
+    }
+    if (patientInfo.created) {
+      console.log(`✅ Default patient account created for frontend login: ${patientInfo.email}`);
     }
     app.listen(PORT, () => {
       console.log(`🌿 MedBless API running on http://localhost:${PORT}`);
